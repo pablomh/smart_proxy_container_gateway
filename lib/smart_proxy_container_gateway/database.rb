@@ -1,4 +1,5 @@
 require 'sequel'
+require 'smart_proxy_container_gateway/profiling'
 module Proxy
   module ContainerGateway
     class Database
@@ -7,6 +8,7 @@ module Proxy
       def initialize(connection_string, db_max_connections, db_pool_timeout, prior_sqlite_db_path = nil)
         Sequel.default_timezone = :local
         @connection = Sequel.connect(connection_string, max_connections: db_max_connections, pool_timeout: db_pool_timeout)
+        Profiling.instrument_database!(@connection)
         if connection_string.start_with?('sqlite://')
           @connection.run("PRAGMA foreign_keys = ON;")
           @connection.run("PRAGMA journal_mode = wal;")

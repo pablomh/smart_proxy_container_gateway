@@ -3,6 +3,7 @@ require 'uri'
 require 'digest'
 require 'erb'
 require 'smart_proxy_container_gateway/dependency_injection'
+require 'smart_proxy_container_gateway/profiling'
 require 'sequel'
 module Proxy
   module ContainerGateway
@@ -22,6 +23,7 @@ module Proxy
         @pulp_client_ssl_key = OpenSSL::PKey::RSA.new(
           File.read(pulp_client_ssl_key)
         )
+        Profiling.instrument_pulp!(self)
       end
       # rubocop:enable Metrics/ParameterLists, Layout/LineLength
 

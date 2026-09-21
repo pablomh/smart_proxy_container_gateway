@@ -48,6 +48,27 @@ The SQLite database file will be deleted after the migration to PostgreSQL is co
 
 Database migrations are completely automated.  The plugin checks if the database is up-to-date at initialization time.
 
+# Performance tuning
+
+Registry requests to Pulp are served over a small pool of persistent, reused
+connections instead of opening a new one per request. `pulp_pool_size`
+defaults to the CPU core count (minimum 4) if unset -- an unverified
+starting point; tune it once real throughput/latency numbers are available:
+```
+:pulp_pool_size: 4
+:pulp_connect_timeout: 30
+:pulp_read_timeout: 60
+:pulp_keep_alive_timeout: 10
+```
+
+Manifest/blob/tag resolution can optionally be cached in a shared Valkey
+store, so hosts pulling the same content around the same time don't each
+re-resolve it from Pulp. Requires the `redis` client gem; falls back to
+always calling Pulp if unset or unreachable:
+```
+:cache_url: redis://localhost:6379/0
+```
+
 # Katello interaction
 
 Auth information is retrieved from the Katello server during smart proxy sync time and cached in the database.

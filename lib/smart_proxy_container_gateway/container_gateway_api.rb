@@ -347,7 +347,7 @@ module Proxy
       def translated_headers_for_proxy
         current_headers = {}
         env = request.env.select do |key, _value|
-          key.match("^HTTP_.*")
+          key.start_with?('HTTP_')
         end
         env.each do |header|
           current_headers[header[0].split('_')[1..].join('-')] = header[1]
@@ -424,14 +424,15 @@ module Proxy
 
         def initialize(value)
           @value = value || ''
+          @parts = @value.split(' ')
         end
 
         def user
-          container_gateway_main.token_user(@value.split(' ')[1])
+          valid_user
         end
 
         def valid_user_token?
-          token_auth? && container_gateway_main.valid_token?(@value.split(' ')[1])
+          !valid_user.nil?
         end
 
         def raw_header
@@ -443,32 +444,42 @@ module Proxy
         end
 
         def unauthorized_token?
-          @value.split(' ')[1] == UNAUTHORIZED_TOKEN
+          @parts[1] == UNAUTHORIZED_TOKEN
         end
 
         def unauthenticated_token?
-          @value.split(' ')[1] == UNAUTHENTICATED_TOKEN
+          @parts[1] == UNAUTHENTICATED_TOKEN
         end
 
         def token_auth?
-          @value.split(' ')[0] == 'Bearer'
+          @parts[0] == 'Bearer'
         end
 
         def basic_auth?
-          @value.split(' ')[0] == 'Basic'
+          @parts[0] == 'Basic'
         end
 
         def blank?
-          Base64.decode64(@value.split(' ')[1]) == ':'
+          Base64.decode64(@parts[1]) == ':'
         end
 
         # A special case for the V1 API.  Defer authentication to Foreman and return the username. `nil` if not authorized.
         def v1_foreman_authorized_username
-          username = Base64.decode64(@value.split(' ')[1]).split(':')[0]
+          username = Base64.decode64(@parts[1]).split(':')[0]
           auth_response = ForemanApi.new.fetch_token(raw_header, { 'account' => username })
           return username if auth_response.code.to_i == 200 && (JSON.parse(auth_response.body)['token'] != 'unauthenticated')
 
           nil
+        end
+
+        private
+
+        # Memoized: valid_user_token? and user are always called together on the
+        # request path, so this collapses what used to be two DB round trips into one.
+        def valid_user
+          return @valid_user if defined?(@valid_user)
+
+          @valid_user = token_auth? ? container_gateway_main.valid_token_user(@parts[1]) : nil
         end
       end
     end

@@ -141,6 +141,19 @@ class ContainerGatewayBackendTest < Test::Unit::TestCase
     refute @container_gateway_main.valid_token?('mytoken')
   end
 
+  def test_token_cleanup_is_rate_limited
+    @container_gateway_main.insert_token('joe', 'firsttoken', Time.now + 60)
+    user_id = @database.connection[:users].first(name: 'joe')[:id]
+    @database.connection[:authentication_tokens].insert(
+      token_checksum: 'expiredchecksum', expire_at: (Time.now - 60).to_s, user_id: user_id
+    )
+
+    @container_gateway_main.insert_token('joe', 'secondtoken', Time.now + 60)
+
+    refute_nil @database.connection[:authentication_tokens].first(token_checksum: 'expiredchecksum'),
+               'cleanup should be rate-limited and skip this insert'
+  end
+
   def test_update_user_repo_mapping
     @container_gateway_main.update_repository_list([{ 'repository' => 'test_repo1', 'auth_required' => true },
                                                     { 'repository' => 'test_repo2', 'auth_required' => true },
@@ -358,28 +371,18 @@ class ContainerGatewayBackendTest < Test::Unit::TestCase
     assert_equal 0, @database.connection[:hosts_repositories].count
   end
 
-  def test_build_host_entries_with_nil_uuid
+  def test_build_host_repository_mapping_filters_nil_uuid
     @container_gateway_main.update_repository_list([{ 'repository' => 'test_repo1', 'auth_required' => true }])
+    host_repo_maps = { 'hosts' => [{ nil => [{ 'repository' => 'test_repo1', 'auth_required' => true }] }] }
 
-    hosts = @database.connection[:hosts]
-    repositories = @database.connection[:repositories]
-    repos = [{ 'repository' => 'test_repo1', 'auth_required' => true }]
-
-    result = @container_gateway_main.build_host_entries(hosts, repositories, nil, repos)
-
-    assert_nil result
+    assert_empty @container_gateway_main.build_host_repository_mapping(host_repo_maps)
   end
 
-  def test_build_host_entries_with_empty_string_uuid
+  def test_build_host_repository_mapping_filters_empty_string_uuid
     @container_gateway_main.update_repository_list([{ 'repository' => 'test_repo1', 'auth_required' => true }])
+    host_repo_maps = { 'hosts' => [{ '' => [{ 'repository' => 'test_repo1', 'auth_required' => true }] }] }
 
-    hosts = @database.connection[:hosts]
-    repositories = @database.connection[:repositories]
-    repos = [{ 'repository' => 'test_repo1', 'auth_required' => true }]
-
-    result = @container_gateway_main.build_host_entries(hosts, repositories, '', repos)
-
-    assert_nil result
+    assert_empty @container_gateway_main.build_host_repository_mapping(host_repo_maps)
   end
 end
 # rubocop:enable Metrics/AbcSize

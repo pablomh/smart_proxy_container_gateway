@@ -23,6 +23,7 @@ module Proxy
       # test for creatable
       validate_readable :pulp_client_ssl_ca, :pulp_client_ssl_cert, :pulp_client_ssl_key
       validate :pulp_endpoint, url: true
+      validate :cache_url, optional_url: true
 
       rackup_path File.join(__dir__, 'container_gateway_http_config.ru')
 
@@ -46,7 +47,9 @@ module Proxy
           Proxy::ContainerGateway::ContainerGatewayMain.new(
             database: container_instance.get_dependency(:database_impl),
             **settings.slice(:pulp_endpoint, :pulp_client_ssl_ca, :pulp_client_ssl_cert,
-                             :pulp_client_ssl_key, :client_endpoint)
+                             :pulp_client_ssl_key, :client_endpoint, :pulp_pool_size,
+                             :pulp_connect_timeout, :pulp_read_timeout, :pulp_keep_alive_timeout,
+                             :cache_url)
           )
         end)
       end

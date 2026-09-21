@@ -16,3 +16,16 @@
 #:sqlite_db_path: '/var/lib/foreman-proxy/smart_proxy_container_gateway.db'
 # Database busy timeout in milliseconds
 #:sqlite_timeout: 30000
+
+# Pulp connection pool (persistent connections reused across registry requests).
+# Defaults to the number of CPU cores (minimum 4) if unset -- an unverified
+# starting point, not a load-tested value.
+#:pulp_pool_size: 4
+#:pulp_connect_timeout: 30
+#:pulp_read_timeout: 60
+#:pulp_keep_alive_timeout: 10
+
+# Optional: shared Valkey cache for Pulp manifest/blob/tag redirect resolution,
+# useful when many hosts pull the same content around the same time.
+# Falls back to always calling Pulp if unset or unreachable. Requires the 'redis' client gem.
+#:cache_url: redis://localhost:6379/0

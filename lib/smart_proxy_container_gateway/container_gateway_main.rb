@@ -3,6 +3,8 @@ require 'uri'
 require 'digest'
 require 'erb'
 require 'smart_proxy_container_gateway/dependency_injection'
+require 'smart_proxy_container_gateway/pulp_connection'
+require 'smart_proxy_container_gateway/pulp_redirect_cache'
 require 'smart_proxy_container_gateway/profiling'
 require 'sequel'
 module Proxy
@@ -13,8 +15,16 @@ module Proxy
     class ContainerGatewayMain
       attr_reader :database, :client_endpoint
 
+      # Duck-types Net::HTTPResponse (code/body/[]) for cache hits and misses alike.
+      ResolvedPulpResponse = Struct.new(:code, :body, :headers) do
+        def [](header)
+          headers[header.to_s.downcase.to_sym]
+        end
+      end
+
       # rubocop:disable Metrics/ParameterLists, Layout/LineLength
-      def initialize(database:, pulp_endpoint:, pulp_client_ssl_ca:, pulp_client_ssl_cert:, pulp_client_ssl_key:, client_endpoint: nil)
+      def initialize(database:, pulp_endpoint:, pulp_client_ssl_ca:, pulp_client_ssl_cert:, pulp_client_ssl_key:, client_endpoint: nil,
+                     pulp_pool_size: nil, pulp_connect_timeout: nil, pulp_read_timeout: nil, pulp_keep_alive_timeout: nil, cache_url: nil)
         @database = database
         @pulp_endpoint = pulp_endpoint
         @client_endpoint = client_endpoint || pulp_endpoint
@@ -23,24 +33,21 @@ module Proxy
         @pulp_client_ssl_key = OpenSSL::PKey::RSA.new(
           File.read(pulp_client_ssl_key)
         )
+
+        pulp_connection_options = { pulp_endpoint: pulp_endpoint, pulp_client_ssl_ca: pulp_client_ssl_ca,
+                                    pulp_client_ssl_cert: @pulp_client_ssl_cert, pulp_client_ssl_key: @pulp_client_ssl_key }
+        pulp_connection_options[:pool_size] = pulp_pool_size if pulp_pool_size
+        pulp_connection_options[:connect_timeout] = pulp_connect_timeout if pulp_connect_timeout
+        pulp_connection_options[:read_timeout] = pulp_read_timeout if pulp_read_timeout
+        pulp_connection_options[:keep_alive_timeout] = pulp_keep_alive_timeout if pulp_keep_alive_timeout
+        @pulp_connection = PulpConnection.new(**pulp_connection_options)
+        @redirect_cache = PulpRedirectCache.new(cache_url: cache_url)
         Profiling.instrument_pulp!(self)
       end
       # rubocop:enable Metrics/ParameterLists, Layout/LineLength
 
       def pulp_registry_request(uri, headers)
-        http_client = Net::HTTP.new(uri.host, uri.port)
-        http_client.ca_file = @pulp_client_ssl_ca
-        http_client.cert = @pulp_client_ssl_cert
-        http_client.key = @pulp_client_ssl_key
-        http_client.use_ssl = true
-
-        http_client.start do |http|
-          request = Net::HTTP::Get.new uri
-          headers.each do |key, value|
-            request[key] = value
-          end
-          http.request request
-        end
+        @pulp_connection.request(uri, headers)
       end
 
       def flatpak_static_index(headers, params = {})
@@ -60,14 +67,14 @@ module Proxy
         uri = URI.parse(
           "#{@pulp_endpoint}/pulpcore_registry/v2/#{repository}/manifests/#{tag}"
         )
-        pulp_registry_request(uri, headers)
+        cached_pulp_request("manifest:#{repository}:#{tag}:#{headers['ACCEPT']}", uri, headers)
       end
 
       def blobs(repository, digest, headers)
         uri = URI.parse(
           "#{@pulp_endpoint}/pulpcore_registry/v2/#{repository}/blobs/#{digest}"
         )
-        pulp_registry_request(uri, headers)
+        cached_pulp_request("blob:#{repository}:#{digest}", uri, headers)
       end
 
       def tags(repository, headers, params = {})
@@ -81,7 +88,20 @@ module Proxy
         uri = URI.parse(
           "#{@pulp_endpoint}/pulpcore_registry/v2/#{repository}/tags/list#{query}"
         )
-        pulp_registry_request(uri, headers)
+        cached_pulp_request("tags:#{repository}:#{query}", uri, headers)
+      end
+
+      # Manifest resolution is content-negotiated, so the cache key includes Accept;
+      # other forwarded headers (Authorization, User-Agent) are excluded since they'd
+      # fragment the cache without affecting Pulp's answer.
+      def cached_pulp_request(cache_key, uri, headers)
+        resolved = @redirect_cache.fetch(cache_key) do
+          response = pulp_registry_request(uri, headers)
+          { code: response.code, body: response.body,
+            headers: { location: response['location'], link: response['link'] }.compact }
+        end
+
+        ResolvedPulpResponse.new(resolved[:code], resolved[:body], resolved[:headers])
       end
 
       def v1_search(params = {})
@@ -127,106 +147,69 @@ module Proxy
         database.connection[:repositories].where(auth_required: false).order(:name)
       end
 
-      # Replaces the entire list of repositories
+      # Diff-syncs repositories instead of delete-all+reimport, which also avoided
+      # cascading deletes onto repositories_users/hosts_repositories for unchanged rows.
       def update_repository_list(repo_list)
-        # repositories_users cascades on deleting repositories (or users)
-        database.connection.transaction(isolation: :serializable, retry_on: [Sequel::SerializationFailure]) do
-          repository = database.connection[:repositories]
-          repository.delete
+        desired = repo_list.each_with_object({}) do |repo, acc|
+          acc[repo['repository']] = repo['auth_required'].to_s.downcase == "true"
+        end
 
-          repository.import(
-            %i[name auth_required],
-            repo_list.map { |repo| [repo['repository'], repo['auth_required'].to_s.downcase == "true"] }
-          )
+        repository = database.connection[:repositories]
+        database.connection.transaction do
+          apply_repository_diff(repository, repository.to_hash(:name, :auth_required), desired)
         end
       end
 
-      # Replaces the entire user-repo mapping for all logged-in users
       def update_user_repo_mapping(user_repo_maps)
-        # Get hash map of all users and their repositories
-        # Ex: {"users"=> [{"admin"=>[{"repository"=>"repo", "auth_required"=>"true"}]}]}
-        # Go through list of repositories and add them to the DB
-        repositories = database.connection[:repositories]
+        entries = user_repo_maps['users'].flat_map(&:to_a)
+        user_ids_by_name = database.connection[:users].where(name: entries.map(&:first)).to_hash(:name, :id)
+        repo_ids_by_name = auth_required_repository_ids_by_name(
+          entries.flat_map { |_username, repos| extract_auth_required_repo_names(repos) }.uniq
+        )
 
-        entries = user_repo_maps['users'].flat_map do |user_repo_map|
-          user_repo_map.filter_map do |username, repos|
-            user_repo_names = repos.filter { |repo| repo['auth_required'].to_s.downcase == "true" }.map do |repo|
-              repo['repository']
-            end
-            user = database.connection[:users][{ name: username }]
-            repositories.where(name: user_repo_names, auth_required: true).select(:id).map { |repo| [repo[:id], user[:id]] }
-          end
-        end
-        entries.flatten!(1)
+        desired_pairs = entries.flat_map do |username, repos|
+          user_id = user_ids_by_name[username]
+          next [] unless user_id
 
-        repositories_users = database.connection[:repositories_users]
-        database.connection.transaction(isolation: :serializable, retry_on: [Sequel::SerializationFailure]) do
-          repositories_users.delete
-          repositories_users.import(%i[repository_id user_id], entries)
+          repo_ids_for(repos, repo_ids_by_name).map { |repo_id| [repo_id, user_id] }
         end
+
+        sync_repository_pairs(:repositories_users, :user_id, desired_pairs)
       end
 
-      # Replaces the user-repo mapping for a single user
       def update_user_repositories(username, repositories)
         user = database.connection[:users][{ name: username }]
+        desired_ids = auth_required_repository_ids(repositories)
 
-        user_repositories = database.connection[:repositories_users]
-        database.connection.transaction(isolation: :serializable,
-                                        retry_on: [Sequel::SerializationFailure],
-                                        num_retries: 10) do
-          user_repositories.where(user_id: user[:id]).delete
-
-          user_repositories.import(
-            %i[repository_id user_id],
-            database.connection[:repositories].where(name: repositories, auth_required: true).select(:id).map do |repo|
-              [repo[:id], user[:id]]
-            end
-          )
-        end
+        sync_repository_mapping(:repositories_users, :user_id, user[:id], desired_ids)
       end
 
-      # Replaces the entire host-repo mapping for all hosts.
-      # Assumes host is present in the DB.
       def update_host_repo_mapping(host_repo_maps)
-        # Get DB tables
-        hosts_repositories = database.connection[:hosts_repositories]
-
-        # Build list of [repository_id, host_id] pairs
-        entries = build_host_repository_mapping(host_repo_maps)
-
-        # Insert all in a single transaction
-        database.connection.transaction(isolation: :serializable, retry_on: [Sequel::SerializationFailure]) do
-          hosts_repositories.delete
-          hosts_repositories.import(%i[repository_id host_id], entries) unless entries.nil? || entries.empty?
-        end
+        sync_repository_pairs(:hosts_repositories, :host_id, build_host_repository_mapping(host_repo_maps))
       end
 
       def build_host_repository_mapping(host_repo_maps)
         return [] if host_repo_maps['hosts'].nil?
 
-        hosts = database.connection[:hosts]
-        repositories = database.connection[:repositories]
+        entries = host_repo_maps['hosts'].flat_map(&:to_a)
+                                         .reject { |host_uuid, _repos| host_uuid.nil? || host_uuid.to_s.strip.empty? }
+        host_ids_by_uuid = database.connection[:hosts].where(uuid: entries.map(&:first)).to_hash(:uuid, :id)
+        repo_ids_by_name = auth_required_repository_ids_by_name(
+          entries.flat_map { |_uuid, repos| extract_auth_required_repo_names(repos || []) }.uniq
+        )
 
-        entries = host_repo_maps['hosts'].flat_map do |host_map|
-          host_map.filter_map do |host_uuid, repos|
-            build_host_entries(hosts, repositories, host_uuid, repos)
-          end
-        end
-        entries&.flatten(1)&.compact
+        entries.flat_map { |host_uuid, repos| host_repository_pairs(host_uuid, repos, host_ids_by_uuid, repo_ids_by_name) }
       end
 
-      def build_host_entries(hosts, repositories, host_uuid, repos)
-        return if host_uuid.nil? || host_uuid.to_s.strip.empty?
+      def host_repository_pairs(host_uuid, repos, host_ids_by_uuid, repo_ids_by_name)
+        host_id = host_ids_by_uuid[host_uuid]
+        return [] unless host_id && repos && !repos.empty?
 
-        host = hosts[{ uuid: host_uuid }]
-        return unless host
-        return if repos.nil? || repos.empty?
+        repo_ids_for(repos, repo_ids_by_name).map { |repo_id| [repo_id, host_id] }
+      end
 
-        repo_names = extract_auth_required_repo_names(repos)
-        repositories
-          .where(name: repo_names, auth_required: true)
-          .select(:id)
-          .map { |repo| [repo[:id], host[:id]] }
+      def repo_ids_for(repos, repo_ids_by_name)
+        extract_auth_required_repo_names(repos).filter_map { |name| repo_ids_by_name[name] }
       end
 
       def extract_auth_required_repo_names(repos)
@@ -241,20 +224,8 @@ module Proxy
         host = find_or_create_host(uuid)
         return unless host
 
-        hosts_repositories = database.connection[:hosts_repositories]
-        database.connection.transaction(isolation: :serializable,
-                                        retry_on: [Sequel::SerializationFailure],
-                                        num_retries: 10) do
-          hosts_repositories.where(host_id: host[:id]).delete
-          return if repositories.nil? || repositories.empty?
-
-          hosts_repositories.import(
-            %i[repository_id host_id],
-            database.connection[:repositories].where(name: repositories, auth_required: true).select(:id).map do |repo|
-              [repo[:id], host[:id]]
-            end
-          )
-        end
+        desired_ids = repositories.nil? ? [] : auth_required_repository_ids(repositories)
+        sync_repository_mapping(:hosts_repositories, :host_id, host[:id], desired_ids)
       end
 
       def find_or_create_host(uuid)
@@ -267,35 +238,26 @@ module Proxy
       # false if the user is not authorized to access the repo or if it does not exist
       def authorized_for_repo?(repo_name, user_token_is_valid, username = nil)
         repository = database.connection[:repositories][{ name: repo_name }]
-
-        # Repository doesn't exist
         return false if repository.nil?
-
-        # Repository doesn't require auth
         return true unless repository[:auth_required]
+        return false unless username && user_token_is_valid
 
-        if username && user_token_is_valid
-          # User is logged in and has access to the repository
-          return !database.connection[:repositories_users].where(
-            repository_id: repository[:id], user_id: database.connection[:users].first(name: username)[:id]
-          ).empty?
-        end
-
-        false
+        database.connection[:repositories_users]
+                .join(:users, id: :user_id)
+                .where(repository_id: repository[:id], Sequel[:users][:name] => username)
+                .any?
       end
 
       def cert_authorized_for_repo?(repo_name, uuid)
-        database.connection.transaction(isolation: :serializable, retry_on: [Sequel::SerializationFailure]) do
-          repository = database.connection[:repositories][{ name: repo_name }]
-          return false if repository.nil?
-          return true unless repository[:auth_required]
+        repository = database.connection[:repositories][{ name: repo_name }]
+        return false if repository.nil?
+        return true unless repository[:auth_required]
 
-          database.connection[:hosts_repositories]
-                  .where(repository_id: repository[:id])
-                  .join(:hosts, id: :host_id)
-                  .where(Sequel[:hosts][:uuid] => uuid)
-                  .any?
-        end
+        database.connection[:hosts_repositories]
+                .where(repository_id: repository[:id])
+                .join(:hosts, id: :host_id)
+                .where(Sequel[:hosts][:uuid] => uuid)
+                .any?
       end
 
       def token_user(token)
@@ -310,6 +272,17 @@ module Proxy
         end.empty?
       end
 
+      # Combines valid_token? + token_user into a single query for callers that need
+      # both (they're always called together on the request path).
+      def valid_token_user(token)
+        database.connection[:users]
+                .join(:authentication_tokens, user_id: :id)
+                .where(Sequel[:authentication_tokens][:token_checksum] => checksum(token))
+                .where { Sequel[:authentication_tokens][:expire_at] > Sequel::CURRENT_TIMESTAMP }
+                .select_all(:users)
+                .first
+      end
+
       def insert_token(username, token, expire_at_string, clear_expired_tokens: true)
         checksum = Digest::SHA256.hexdigest(token)
         user = Sequel::Model(database.connection[:users]).find_or_create(name: username)
@@ -319,6 +292,7 @@ module Proxy
           Sequel::Model(database.connection[:authentication_tokens]).
             create(token_checksum: checksum, expire_at: expire_at_string.to_s, user_id: user.id)
           return unless clear_expired_tokens
+          return unless due_for_token_cleanup?
 
           database.connection[:authentication_tokens].where { expire_at < Sequel::CURRENT_TIMESTAMP }.delete
         end
@@ -326,8 +300,60 @@ module Proxy
 
       private
 
+      # Expired tokens are already excluded by valid_token?'s own WHERE clause, so
+      # delaying their deletion doesn't affect auth correctness -- only table size.
+      # Rate-limits the sweep so it isn't paid on every single login.
+      TOKEN_CLEANUP_INTERVAL = 300 # seconds
+
+      def due_for_token_cleanup?
+        now = Time.now
+        return false if @last_token_cleanup_at && (now - @last_token_cleanup_at) < TOKEN_CLEANUP_INTERVAL
+
+        @last_token_cleanup_at = now
+        true
+      end
+
       def checksum(token)
         Digest::SHA256.hexdigest(token)
+      end
+
+      def apply_repository_diff(repository, existing, desired)
+        to_remove = existing.keys - desired.keys
+        to_add = desired.keys - existing.keys
+        to_update = desired.keys.select { |name| existing.key?(name) && existing[name] != desired[name] }
+
+        repository.where(name: to_remove).delete unless to_remove.empty?
+        repository.import(%i[name auth_required], to_add.map { |name| [name, desired[name]] }) unless to_add.empty?
+        to_update.each { |name| repository.where(name: name).update(auth_required: desired[name]) }
+      end
+
+      def auth_required_repository_ids(repository_names)
+        database.connection[:repositories].where(name: repository_names, auth_required: true).select_map(:id)
+      end
+
+      def auth_required_repository_ids_by_name(repository_names)
+        database.connection[:repositories].where(name: repository_names, auth_required: true).to_hash(:name, :id)
+      end
+
+      # Syncs join_table rows for a single owner_id to match desired_repository_ids.
+      def sync_repository_mapping(join_table, owner_column, owner_id, desired_repository_ids)
+        sync_repository_pairs(join_table, owner_column, desired_repository_ids.map { |repo_id| [repo_id, owner_id] },
+                              scope: { owner_column => owner_id })
+      end
+
+      # Syncs join_table's (repository_id, owner_column) pairs to match desired_pairs,
+      # touching only rows that changed instead of a full delete + reimport.
+      def sync_repository_pairs(join_table, owner_column, desired_pairs, scope: {})
+        table = database.connection[join_table]
+        existing_pairs = table.where(scope).select_map([:repository_id, owner_column])
+
+        to_remove = existing_pairs - desired_pairs
+        to_add = desired_pairs - existing_pairs
+
+        database.connection.transaction do
+          to_remove.each { |repo_id, owner_id| table.where(:repository_id => repo_id, owner_column => owner_id).delete }
+          table.import([:repository_id, owner_column], to_add) unless to_add.empty?
+        end
       end
     end
   end
